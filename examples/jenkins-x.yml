@@ -1,0 +1,198 @@
+buildPack: none
+dockerRegistryOwner: cldze
+
+pipelineConfig:
+  pipelines:
+    pullRequest:
+      pipeline:
+        agent:
+          image: "gcr.io/jenkinsxio/builder-scala:latest"
+        environment:
+        - name: ARTIFACTORY_USER
+          value: read_only
+        - name: SBT_OPTS
+          value: "-Dsbt.boot.credentials=.sbt/.credentials -Dsbt.repository.config=.sbt/repositories -Dsbt.override.build.repos=true"
+        stages:
+        #-1st-stage (parallel)
+        - name: Tests
+          # options propagates to all stages below this.
+          options:
+            containerOptions:
+              volumeMounts:
+                - mountPath: /root/.sbt
+                  name: sbt
+                  readOnly: false
+                - mountPath: /root/.ivy2
+                  name: ivy
+                  readOnly: false
+            volumes:
+              - name: sbt
+                hostPath:
+                  path: /root/sbt/.sbt
+                  type: DirectoryOrCreate
+              - name: ivy
+                hostPath:
+                  path: /root/sbt/.ivy2
+                  type: DirectoryOrCreate
+          parallel:
+          - name: Unit Tests
+            steps:
+            - name: unit-tests
+              sh: sbt -Dsbt.task.timings=true unit:test
+          #----    
+          - name: Integration Tests
+            # environment:
+            # - name: DATABASE_URL
+            #   value: jdbc:postgresql://postgres-$(echo $APP_NAME)-it-pr-$(echo $PULL_NUMBER)-$(echo $BUILD_NUMBER}:5432/test?user=postgres&password=test
+            steps:
+            - name: create-database-pod
+              image: bitnami/kubectl:latest
+              #sh: kubectl run postgres-$APP_NAME-it-pr-$PULL_NUMBER-$BUILD_NUMBER --labels=role=ci-database,job=postgres-$APP_NAME-pr-$PULL_NUMBER-$BUILD_NUMBER --restart Never --image postgres:9.6-alpine --env="POSTGRES_DB=test" --env="POSTGRES_USER=postgres" --env="POSTGRES_PASSWORD=test" --requests='cpu=400m,memory=512Mi' --limits='cpu=1,memory=1Gi' && kubectl expose pod/postgres-$APP_NAME-it-pr-$PULL_NUMBER-$BUILD_NUMBER --port 5432 --labels=role=ci-database,job=postgres-$APP_NAME-pr-$PULL_NUMBER-$BUILD_NUMBER && kubectl wait --for=condition=ready pod/postgres-$APP_NAME-it-pr-$PULL_NUMBER-$BUILD_NUMBER
+              sh: kubectl run postgres-$APP_NAME-it-pr-$PULL_NUMBER-$BUILD_NUMBER --labels=role=ci-database,job=postgres-$APP_NAME-pr-$PULL_NUMBER-$BUILD_NUMBER --restart Never --image postgres:9.6-alpine --env="POSTGRES_DB=test" --env="POSTGRES_USER=postgres" --env="POSTGRES_PASSWORD=test" --requests='cpu=400m,memory=512Mi' --limits='cpu=1,memory=1Gi' && kubectl expose pod/postgres-$APP_NAME-it-pr-$PULL_NUMBER-$BUILD_NUMBER --port 5432 --labels=role=ci-database,job=postgres-$APP_NAME-pr-$PULL_NUMBER-$BUILD_NUMBER && until kubectl exec postgres-$APP_NAME-it-pr-$PULL_NUMBER-$BUILD_NUMBER -- pg_isready -U postgres -h localhost;do sleep 1;done
+            - name: integration-tests
+              sh: export DATABASE_URL="jdbc:postgresql://postgres-${APP_NAME}-it-pr-${PULL_NUMBER}-${BUILD_NUMBER}:5432/test?user=postgres&password=test" && sbt -Dsbt.task.timings=true flywayClean flywayMigrate it:test
+          #---
+          - name: DB Tests
+            # environment:
+            # - name: DATABASE_URL
+            #   value: "jdbc:postgresql://postgres-${APP_NAME}-dbt-pr-${PULL_NUMBER}-${BUILD_NUMBER}:5432/test?user=postgres&password=test"
+            steps:
+            - name: create-database-pod
+              image: bitnami/kubectl:latest
+              sh: kubectl run postgres-$APP_NAME-dbt-pr-$PULL_NUMBER-$BUILD_NUMBER --labels=role=ci-database,job=postgres-$APP_NAME-pr-$PULL_NUMBER-$BUILD_NUMBER --restart Never --image postgres:9.6-alpine --env="POSTGRES_DB=test" --env="POSTGRES_USER=postgres" --env="POSTGRES_PASSWORD=test" --requests='cpu=400m,memory=512Mi' --limits='cpu=1,memory=1Gi' && kubectl expose pod/postgres-$APP_NAME-dbt-pr-$PULL_NUMBER-$BUILD_NUMBER --port 5432 --labels=role=ci-database,job=postgres-$APP_NAME-pr-$PULL_NUMBER-$BUILD_NUMBER && until kubectl exec postgres-$APP_NAME-it-pr-$PULL_NUMBER-$BUILD_NUMBER -- pg_isready -U postgres -h localhost;do sleep 1;done
+            - name: db-tests
+              sh: export DATABASE_URL="jdbc:postgresql://postgres-${APP_NAME}-dbt-pr-${PULL_NUMBER}-${BUILD_NUMBER}:5432/test?user=postgres&password=test" && sbt -Dsbt.task.timings=true flywayClean flywayMigrate db:test
+        #-2nd-stage
+        - name: Cleanup & Image Build
+          options:
+            containerOptions:
+              volumeMounts:
+                - mountPath: /kaniko/.docker
+                  name: jenkins-docker-cfg
+                  readOnly: false
+            volumes:
+              - name: jenkins-docker-cfg
+                secret:
+                  secretName: jenkins-docker-cfg
+          steps:
+          - name: clean-db-pods
+            image: bitnami/kubectl:latest
+            sh: kubectl delete pod,svc -l=job=postgres-$APP_NAME-pr-$PULL_NUMBER-$BUILD_NUMBER
+          - name: sbt-stage
+            sh: sbt stage
+          - name: build-and-push-image
+            command: /kaniko/executor
+            image: gcr.io/kaniko-project/executor:9912ccbf8d22bbafbf971124600fbb0b13b9cbd6
+            args:
+            - --dockerfile=/workspace/source/Dockerfile
+            - --destination=242867168342.dkr.ecr.eu-west-1.amazonaws.com/$REPO_OWNER/$APP_NAME:$PREVIEW_VERSION
+            - --context=/workspace/source
+
+    release:
+      pipeline:
+        agent:
+          image: "gcr.io/jenkinsxio/builder-scala:latest"
+        environment:
+        - name: ARTIFACTORY_USER
+          value: read_only
+        - name: ARTIFACTORY_PASSWORD
+          value: bob_read_only_123
+        - name: SBT_OPTS
+          value: "-Dsbt.boot.credentials=.sbt/.credentials -Dsbt.repository.config=.sbt/repositories -Dsbt.override.build.repos=true"
+        stages:
+        #-1st-stage (parallel)
+        - name: Tests
+          options:
+            containerOptions:
+              volumeMounts:
+                - mountPath: /root/.sbt
+                  name: sbt
+                  readOnly: false
+                - mountPath: /root/.ivy2
+                  name: ivy
+                  readOnly: false
+            volumes:
+              - name: sbt
+                hostPath:
+                  path: /root/sbt/.sbt
+                  type: DirectoryOrCreate
+              - name: ivy
+                hostPath:
+                  path: /root/sbt/.ivy2
+                  type: DirectoryOrCreate
+          parallel:
+          - name: Unit Tests
+            steps:
+            - name: unit-tests
+              sh: sbt -Dsbt.task.timings=true unit:test
+          #----    
+          - name: Integration Tests
+            environment:
+            - name: DATABASE_URL
+              value: "jdbc:postgresql://postgres-it-$BRANCH_NAME-$BUILD_NUMBER:5432/test?user=postgres&password=test"
+            steps:
+            - name: create-database-pod
+              image: bitnami/kubectl:latest
+              sh: kubectl run postgres-it-$BRANCH_NAME-$BUILD_NUMBER --labels=role=ci-database,job=postgres-$BRANCH_NAME-$BUILD_NUMBER --restart Never --image postgres:9.6-alpine --env="POSTGRES_DB=test" --env="POSTGRES_USER=postgres" --env="POSTGRES_PASSWORD=test" --requests='cpu=400m,memory=512Mi' --limits='cpu=1,memory=1Gi' && kubectl expose pod/postgres-it-$BRANCH_NAME-$BUILD_NUMBER --port 5432 --labels=role=ci-database,job=postgres-pr-$PULL_NUMBER-$BUILD_NUMBER
+            - name: integration-tests
+              sh: sbt -Dsbt.task.timings=true flywayClean flywayMigrate it:test
+          #---
+          - name: DB Tests
+            environment:
+            - name: DATABASE_URL
+              value: "jdbc:postgresql://postgres-dbt-$BRANCH_NAME-$BUILD_NUMBER:5432/test?user=postgres&password=test"
+            steps:
+            - name: create-database-pod
+              image: bitnami/kubectl:latest
+              sh: kubectl run postgres-dbt-$BRANCH_NAME-$BUILD_NUMBER --labels=role=ci-database,job=postgres-$BRANCH_NAME-$BUILD_NUMBER --restart Never --image postgres:9.6-alpine --env="POSTGRES_DB=test" --env="POSTGRES_USER=postgres" --env="POSTGRES_PASSWORD=test" --requests='cpu=400m,memory=512Mi' --limits='cpu=1,memory=1Gi' && kubectl expose pod/postgres-dbt-$BRANCH_NAME-$BUILD_NUMBER --port 5432 --labels=role=ci-database,job=postgres-pr-$PULL_NUMBER-$BUILD_NUMBER
+            - name: db-tests
+              sh: sbt -Dsbt.task.timings=true flywayClean flywayMigrate db:test
+        #-2nd-stage
+        - name: clean-db-pods
+          steps:
+          - name: clean-db-pods
+            image: bitnami/kubectl:latest
+            sh: kubectl delete pod,svc -l=job=postgres-$BRANCH_NAME-$BUILD_NUMBER
+        #-3rd-stage
+        - name: Kaniko Image Build
+          options:
+            containerOptions:
+              volumeMounts:
+                - mountPath: /kaniko/.docker
+                  name: jenkins-docker-cfg
+                  readOnly: false
+            volumes:
+              - name: jenkins-docker-cfg
+                secret:
+                  secretName: jenkins-docker-cfg
+          steps:
+          - name: sbt-stage
+            sh: sbt stage
+            #--
+          - name: container-build
+            sh: export VERSION=`cat VERSION` && skaffold build -f skaffold.yaml
+            #--
+          - name: next-version
+            sh: jx step next-version --use-git-tag-only --tag
+          #- sh: jx step post build --image $DOCKER_REGISTRY/$ORG/$APP_NAME:\$(cat VERSION)
+          #  name: post-build          
+          # - name: kaniko-image-build
+          #   command: /kaniko/executor
+          #   image: gcr.io/kaniko-project/executor:v0.19.0
+          #   args:
+          #   - --dockerfile=/Dockerfile
+          #   - --destination=${APP_NAME}:${VERSION}
+          #   - --cache=true
+          #   - --context=/workspace/source
+        - name: Promote
+          dir: ./charts/$APP_NAME
+          steps:
+          - sh: jx step changelog --batch-mode --version v$(cat ../../VERSION) 
+            name: changelog
+            image: gcr.io/jenkinsxio-labs/jxl
+          - sh: jx step helm release
+            name: helm-release
+            image: gcr.io/jenkinsxio-labs/jxl
+          - sh: jx promote -b --all-auto --timeout 1h --version $(cat ../../VERSION)
+            name: jx-promote
+            image: gcr.io/jenkinsxio-labs/jxl

@@ -1,0 +1,17 @@
+env:
+- name: DEPLOY_NAMESPACE
+  value: staging
+pipelineConfig:
+  env:
+  - name: DEPLOY_NAMESPACE
+    value: staging
+  pipelines:
+    overrides:
+    - name: helm-apply
+      pipeline: release
+      type: after
+      steps:
+      - name: Promote
+        steps:
+        - name: production-promotion
+          sh: jx get applications -pu -e staging | grep '[0-9]' | sort -u | awk '{print "jx promote "$1" --version "$2 " -e production"}'| bash
